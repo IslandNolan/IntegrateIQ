@@ -1,9 +1,11 @@
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import dto.AuthInfo;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.extern.log4j.Log4j2;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.Instant;
 import java.util.Objects;
 
 
@@ -15,9 +17,13 @@ import java.util.Objects;
 @Log4j2
 public class Application {
 
-    //process configurations in Application.java
-    private static IntegrationRoutines integrationRoutines;
-    public static final ObjectMapper om = new ObjectMapper();
+    //declare statically and register java time module for Instant.java (timestamps)
+    public static final ObjectMapper om = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .setSerializationInclusion(JsonInclude.Include.NON_NULL);
+
+    //Used to verify that all the contacts were updated successfully.
+    public static final Instant timeStarted = Instant.now();
     public static void main(String[] args) {
 
         if(args.length==0) {
@@ -28,17 +34,16 @@ public class Application {
             try(InputStream is = Objects.requireNonNull(Application.class.getResource("settings.json")).openStream()) {
 
                 AuthInfo ai = om.readValue(is, AuthInfo.class);
-                integrationRoutines = IntegrationRoutines.builder()
+                //process configurations in Application.java
+                IntegrationRoutines integrationRoutines = IntegrationRoutines.builder()
                         .auth(ai)
                         .build();
 
-
                 //Fetch
-                log.info("Getting Contacts.. ");
-                integrationRoutines.fetchContacts();
-                log.info(String.format("Fetched %s contact(s)",integrationRoutines.getContacts().size()));
+                integrationRoutines.fetchAWSContacts();
 
                 //Create or update by email
+                integrationRoutines.pushContacts();
 
                 //Validate records were successfully created/updated.
 
