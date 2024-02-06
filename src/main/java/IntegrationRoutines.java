@@ -1,16 +1,14 @@
 import dto.aws.SampleDataDto;
-import dto.hubspot.v1.HSPostContactsV1;
 import dto.hubspot.v1.HSPropertyListV1;
-import dto.hubspot.v3.HSContactV3;
-import dto.hubspot.v3.HSGetContactsV3;
+import dto.hubspot.v3.*;
 import lombok.*;
 import lombok.extern.log4j.Log4j2;
 import okhttp3.*;
 
 import java.io.IOException;
-import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.commons.collections4.*;
 
@@ -19,9 +17,13 @@ public class IntegrationRoutines {
 
     private static final String AWS_DATA_URL = "https://l0hefgbbla.execute-api.us-east-1.amazonaws.com/prod/contacts";
     private static final String HS_URL_BASE = "https://api.hubapi.com/";
-    private static final String HS_CONTACTS_BATCH_V3 = "crm/v3/objects/contacts";
-    private static final String HS_CONTACTS_BATCH_V1 = "contacts/v1/contact/batch/";
+    private static final String HS_CONTACTS_V3 = HS_URL_BASE+"crm/v3/objects/contacts";
+    private static final String HS_CONTACTS_BATCH_V3_CREATE = HS_CONTACTS_V3+"/batch/create";
+    private static final String HS_CONTACTS_BATCH_V3_UPDATE = HS_CONTACTS_V3+"/batch/update";
+    private static final String HS_CONTACTS_BATCH_V3_SEARCH = HS_CONTACTS_V3+"/search";
+    private static final String HS_CONTACTS_BATCH_V1 = HS_URL_BASE+"contacts/v1/contact/batch/";
     private static final String AUTHORIZATION = "Authorization";
+    private static final MediaType MEDIA_TYPE = MediaType.parse("application/json");
 
     @NonNull private AuthInfo auth;
 
@@ -29,15 +31,13 @@ public class IntegrationRoutines {
     private OkHttpClient restClient = new OkHttpClient.Builder()
             .followRedirects(true)
             .build();
-
-    @Builder.Default private List<SampleDataDto> contacts = new ArrayList<>();
+    //Used for fetching existing contacts from HS
     @Builder.Default private ArrayList<HSContactV3> hsContacts = new ArrayList<>();
-    @Builder.Default private HashSet<String> emails = new HashSet<>();
-    @Builder.Default private EnumMap<HubspotMode,ArrayList<HSPropertyListV1>> postMappings = new EnumMap<>(HubspotMode.class);
 
-    public void fetchAWSContacts() {
+    public List<SampleDataDto> fetchAWSContacts() {
 
-        log.info("Retrieving contacts.. ");
+        log.info("Retrieving contacts from AWS");
+        ArrayList<SampleDataDto> contacts = new ArrayList<>();
 
         Request contactsRequest = new Request.Builder()
                 .addHeader(AUTHORIZATION, getAuth().getAwsAuthHeader())
@@ -51,63 +51,14 @@ public class IntegrationRoutines {
                 assert response.body() != null;
                 String body = response.body().string();
 
-                //todo: add pagination if required..
-                contacts.addAll(Arrays.stream(Application.om.readValue(body, SampleDataDto[].class)).toList());
-                log.info(String.format("Fetched %s AWS contact(s)", getContacts().size()));
-
+                contacts = new ArrayList<>(Arrays.stream(Application.om.readValue(body, SampleDataDto[].class)).toList());
+                log.info(String.format("Retrieved %s AWS contact(s)", contacts.size()));
 
             } else throw new IOException(response.code() + ": " + response.message());
-        }
-        catch (IOException e) { log.info("Request failed -> "+e.getMessage()); }
+        } catch (IOException e) { log.info("Request failed -> "+e.getMessage()); }
+
+        return contacts;
     }
-
-    public void getHubspotContacts(String cursor, int retries) {
-
-        //if max retries, then just return and do nothing
-        if(retries>3) { log.error("Maximum number of retries exceeded"); return; }
-
-        //Fetch all emails, then decide to include in UPDATE, or CREATE.
-        HttpUrl.Builder urlBuild = Objects.requireNonNull(HttpUrl.parse(HS_URL_BASE + HS_CONTACTS_BATCH_V3)).newBuilder();
-        if(Objects.nonNull(cursor)) { urlBuild.addQueryParameter("after",cursor); }
-
-        Request contactsRequest = new Request.Builder()
-                .addHeader(AUTHORIZATION, getAuth().getHubspotAuthHeader())
-                .method("GET",null)
-                .url(
-                    urlBuild.addQueryParameter("limit","100").build()
-                )
-                .build();
-
-        try (Response response = restClient.newCall(contactsRequest).execute()) {
-
-            //careful of rate limiting for get request (100 Burst/10 seconds)
-            switch(response.code()) {
-                case 200 -> {
-                    assert response.body() != null;
-                    String body = response.body().string();
-
-                    HSGetContactsV3 contactList = Application.om.readValue(body, HSGetContactsV3.class);
-                    hsContacts.addAll(contactList.getResults());
-
-                    log.info(String.format("Fetched %s HS contact(s)", hsContacts.size()));
-
-                    if(Objects.nonNull(contactList.getPaging())) {
-                        getHubspotContacts(contactList.getPaging().getNext().getAfter(),retries);
-                    }
-                }
-                case 429 -> {
-                    //Rate limited by hubspot
-                    log.info("HS Rate Limit, waiting 10 seconds");
-                    Thread.sleep(10000);
-                    getHubspotContacts(cursor,retries+1);
-                }
-                default -> log.warn("Unrecognized response status: "+response.code());
-            }
-        }
-        catch (IOException e) {  log.error("Request failed -> "+e.getMessage()); }
-        catch (InterruptedException ignored) { }
-    }
-
     public static HSPropertyListV1 map(SampleDataDto contact) {
         return HSPropertyListV1.builder()
                 .firstname(contact.getFirstName())
@@ -116,43 +67,191 @@ public class IntegrationRoutines {
                 .phone(contact.getPhoneNumber())
                 .build();
     }
-    public void pushContacts() {
+    public static HSPropertyV3 mapV3(SampleDataDto contact) {
+        return HSPropertyV3.builder()
+                .firstname(contact.getFirstName())
+                .lastname(contact.getLastName())
+                .phone(contact.getPhoneNumber())
+                .email(contact.getEmail())
+                .build();
+    }
+    public int pushContacts(List<SampleDataDto> contacts) {
 
-        AtomicInteger contactsWNoEmail = new AtomicInteger(0);
+        log.info(String.format("Posting %s contacts to Hubspot",contacts.size()));
+
+        AtomicInteger numberOfContactsModified = new AtomicInteger(0);
+        HashSet<SampleDataDto> altContacts = new HashSet<>();
         //Attempt to batch create/update with the v1 endpoints. If any batch fails send one at a time until
         // we find the failing one, then add it to an error log
 
         Request.Builder rs = new Request.Builder()
                 .addHeader(AUTHORIZATION,getAuth().getHubspotAuthHeader())
-                .url(HS_URL_BASE+HS_CONTACTS_BATCH_V1);
+                .url(HS_CONTACTS_BATCH_V1);
 
-        ListUtils.partition(contacts,50).forEach(propertyList -> {
+        //Split this into sets of 50 contacts. Small batches better in case one request fails.
+        ListUtils.partition(contacts.stream().filter(contact -> {
+                    if(Objects.isNull(contact.getEmail())) {
+                        //if the email does not exist, then we must upload this contact individually
+                        altContacts.add(contact);
+                        return false;
+                    }
+                    return true;
+                })
+                .map(IntegrationRoutines::map).toList(),50)
+                .forEach(mappedContacts -> {
+                    try {
+                        String requestString = Application.om.writeValueAsString(mappedContacts);
 
-            List<HSPostContactsV1> requestBody = propertyList.stream()
-                    .filter(contact -> {
-                        if(Objects.isNull(contact.getEmail())) { contactsWNoEmail.incrementAndGet(); return false; }
-                        return true;
-                    })
-                    .map(contact -> new HSPostContactsV1(map(contact))).toList();
+                        //Clone above request with .newBuilder, then add the current body and send request.
+                        Request postContactsRequest = rs.build().newBuilder()
+                                .method("POST", RequestBody.create(requestString, MEDIA_TYPE))
+                                .build();
 
-            try {
-                String requestString = Application.om.writeValueAsString(requestBody);
-                Request.Builder newRs = rs.build().newBuilder()
-                        .method("POST", RequestBody.create(requestString,MediaType.get("application/json")));
+                        Response postContactsResponse = restClient.newCall(postContactsRequest).execute();
+                        switch (postContactsResponse.code()) {
+                            case 202 -> numberOfContactsModified.updateAndGet(v -> v + mappedContacts.size());
+                            default -> log.info("Status: " + postContactsResponse.code() + ": " + postContactsResponse.message() + " -> " + requestString);
+                        }
+                    } catch (Exception ex) { log.error("Something went wrong while posting contacts to "+HS_CONTACTS_BATCH_V1); }
+                });
 
-                Response response = restClient.newCall(newRs.build()).execute();
-                switch(response.code()) {
-                    default -> log.info("Status: "+response.code()+": "+ response.message()+" -> "+requestString);
+        log.info(String.format("Posted %s regular contacts",contacts.size()-altContacts.size()));
+
+        try {
+            //This was created to process contacts returned from AWS that do not contain an email.
+            numberOfContactsModified.addAndGet(processAlternativeContacts(altContacts));
+        } catch (Exception ex) { log.error("Something went wrong while posting alternative contacts to "+HS_CONTACTS_BATCH_V3_CREATE); }
+
+        return numberOfContactsModified.get();
+    }
+    private int processAlternativeContacts(HashSet<SampleDataDto> altContacts) throws Exception {
+
+        AtomicInteger altContactsModified = new AtomicInteger(0);
+
+        if (!altContacts.isEmpty()) {
+            log.info(String.format("Discovered %s contacts with no email. Using Phone Number", altContacts.size()));
+            HashMap<String, Integer> existingContacts = new HashMap<>(); //<phone #, hs_id>
+
+            //phone is not included in response by default, this will act as our way to identify existing contacts
+            List<HSFilterGroup> phoneNumberFilter = List.of(new HSFilterGroup(List.of(HSFilter.builder()
+                    .propertyName("phone")
+                    .operator("IN")
+                    .values(altContacts.stream().map(SampleDataDto::getPhoneNumber).toList())
+                    .build())
+            ));
+            HSSearchV3 searchv3 = HSSearchV3.builder()
+                    .limit(altContacts.size())
+                    .filterGroups(phoneNumberFilter)
+                    .properties(List.of("phone", "email", "firstname", "lastname", "email"))
+                    .build();
+
+            Request searchRequest = new Request.Builder()
+                    .addHeader(AUTHORIZATION, getAuth().getHubspotAuthHeader())
+                    .url(HS_CONTACTS_BATCH_V3_SEARCH)
+                    .method("POST", RequestBody.create(Application.om.writeValueAsString(searchv3), MEDIA_TYPE))
+                    .build();
+
+            Response searchResponse = restClient.newCall(searchRequest).execute();
+
+            //make request, read into object.
+            HSSearchResponse searchResults = Application.om.readValue(searchResponse.body().string(), HSSearchResponse.class);
+            searchResults.getResults().forEach(contact -> existingContacts.put(contact.getProperties().getPhone(), contact.getId()));
+
+            //create all the ones that do not exist, update the rest.
+            ArrayList<HSPropertyV3> create = new ArrayList<>();
+            ArrayList<HSPropertyV3> update = new ArrayList<>();
+
+            altContacts.forEach(contact -> {
+                if (!existingContacts.containsKey(contact.getPhoneNumber())) {
+                    create.add(mapV3(contact));
+                } else update.add(mapV3(contact));
+            });
+
+            if (!create.isEmpty()) {
+                String createBody = Application.om.writeValueAsString(new HSContactPostV3(create));
+                Request createRequest = new Request.Builder()
+                        .addHeader(AUTHORIZATION, getAuth().getHubspotAuthHeader())
+                        .url(HS_CONTACTS_BATCH_V3_CREATE)
+                        .method("POST", RequestBody.create(createBody, MEDIA_TYPE))
+                        .build();
+
+                Response createResponse = restClient.newCall(createRequest).execute();
+                switch (createResponse.code()) {
+                    case 201 -> {
+                        altContactsModified.addAndGet(create.size());
+                        log.info(String.format("Created %s alternate contacts", create.size()));
+                    }
                 }
-            } catch (Exception ignored) {}
-        });
+            }
+            if (!update.isEmpty()) {
 
-        log.info(String.format("Contacts with no email: %s",contactsWNoEmail.get()));
+                HSContactPostV3 bodyContent = new HSContactPostV3(update);
+                bodyContent.getInputs().forEach(element -> element.setId(existingContacts.get(element.getProperties().getPhone())));
+
+                String updateBody = Application.om.writeValueAsString(bodyContent);
+
+                Request updateRequest = new Request.Builder()
+                        .addHeader(AUTHORIZATION, getAuth().getHubspotAuthHeader())
+                        .url(HS_CONTACTS_BATCH_V3_UPDATE)
+                        .method("POST", RequestBody.create(updateBody, MEDIA_TYPE))
+                        .build();
+
+                Response updateResponse = restClient.newCall(updateRequest).execute();
+                switch (updateResponse.code()) {
+                    case 200 -> {
+                        altContactsModified.addAndGet(update.size());
+                        log.info(String.format("Updated %s alternate contacts", update.size()));
+                    }
+                }
+            }
+        }
+
+        return altContactsModified.get();
     }
 
-    public void verify(Instant applicationStartTime) {
-        //verify emails that were sent for legacy endpoint
-        //verify vid by singular creation after endpoint returns it.
-        //(investigate timestamp capabilities)
+    /**
+     * Verify # of records modified
+
+     * Works by recording the timestamp when the application starts,
+     * then passing the epoch second to Hubspot to check how many records have been updated.
+     */
+    public void verify(int numberOfContactsModified, int retries) {
+
+        try {
+            List<HSFilterGroup> timestampFilter = List.of(new HSFilterGroup(List.of(HSFilter.builder()
+                    .value(String.valueOf(Application.timeStarted.getEpochSecond()))
+                    .operator("GT")
+                    .propertyName("lastmodifieddate")
+                    .build()
+            )));
+
+            HSSearchV3 searchv3 = HSSearchV3.builder()
+                    //just limit to one, all we care about is the 'total' value since this is restricted by timestamp.
+                    .limit(1)
+                    .filterGroups(timestampFilter)
+                    .properties(List.of("phone","email","firstname","lastname","email"))
+                    .build();
+
+            Request searchRequest = new Request.Builder()
+                    .addHeader(AUTHORIZATION, getAuth().getHubspotAuthHeader())
+                    .url(HS_CONTACTS_BATCH_V3_SEARCH)
+                    .method("POST",RequestBody.create(Application.om.writeValueAsString(searchv3),MEDIA_TYPE))
+                    .build();
+
+            HSSearchResponse response = Application.om.readValue(restClient.newCall(searchRequest).execute().body().string(),HSSearchResponse.class);
+            if(response.getTotal().equals(numberOfContactsModified)) {
+                log.info(String.format("[VERIFY] %s contacts updated/created",numberOfContactsModified));
+            }
+            else {
+                if(retries+1>4) {
+                    log.error("[VERIFY] Unable to verify modified contacts after 3 retries.. ");
+                } else {
+                    log.info("[VERIFY] Hubspot still processing.. waiting 10 seconds");
+                    Thread.sleep(10000);
+                    verify(numberOfContactsModified,retries+1);
+                }
+            }
+        }
+        catch (Exception ignore) {}
     }
 }
