@@ -1,5 +1,6 @@
 import dto.aws.SampleDataDto;
-import dto.hubspot.v1.HSPropertyListV1;
+import dto.hubspot.v1.HSPostContactsV1;
+import dto.hubspot.v1.HSPostPropertyListV1;
 import dto.hubspot.v3.*;
 import lombok.*;
 import lombok.extern.log4j.Log4j2;
@@ -8,7 +9,6 @@ import okhttp3.*;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.commons.collections4.*;
 
@@ -59,8 +59,8 @@ public class IntegrationRoutines {
 
         return contacts;
     }
-    public static HSPropertyListV1 map(SampleDataDto contact) {
-        return HSPropertyListV1.builder()
+    public static HSPostPropertyListV1 map(SampleDataDto contact) {
+        return HSPostPropertyListV1.builder()
                 .firstname(contact.getFirstName())
                 .lastname(contact.getLastName())
                 .email(contact.getEmail())
@@ -97,7 +97,9 @@ public class IntegrationRoutines {
                     }
                     return true;
                 })
-                .map(IntegrationRoutines::map).toList(),50)
+                .map(IntegrationRoutines::map)
+                .map(HSPostContactsV1::new)
+                .toList(),50)
                 .forEach(mappedContacts -> {
                     try {
                         String requestString = Application.om.writeValueAsString(mappedContacts);
@@ -133,7 +135,7 @@ public class IntegrationRoutines {
             HashMap<String, Integer> existingContacts = new HashMap<>(); //<phone #, hs_id>
 
             //phone is not included in response by default, this will act as our way to identify existing contacts
-            List<HSFilterGroup> phoneNumberFilter = List.of(new HSFilterGroup(List.of(HSFilter.builder()
+            List<HSFilterGroupV3> phoneNumberFilter = List.of(new HSFilterGroupV3(List.of(HSFilterV3.builder()
                     .propertyName("phone")
                     .operator("IN")
                     .values(altContacts.stream().map(SampleDataDto::getPhoneNumber).toList())
@@ -154,7 +156,7 @@ public class IntegrationRoutines {
             Response searchResponse = restClient.newCall(searchRequest).execute();
 
             //make request, read into object.
-            HSSearchResponse searchResults = Application.om.readValue(searchResponse.body().string(), HSSearchResponse.class);
+            HSSearchResponseV3 searchResults = Application.om.readValue(searchResponse.body().string(), HSSearchResponseV3.class);
             searchResults.getResults().forEach(contact -> existingContacts.put(contact.getProperties().getPhone(), contact.getId()));
 
             //create all the ones that do not exist, update the rest.
@@ -218,7 +220,7 @@ public class IntegrationRoutines {
     public void verify(int numberOfContactsModified, int retries) {
 
         try {
-            List<HSFilterGroup> timestampFilter = List.of(new HSFilterGroup(List.of(HSFilter.builder()
+            List<HSFilterGroupV3> timestampFilter = List.of(new HSFilterGroupV3(List.of(HSFilterV3.builder()
                     .value(String.valueOf(Application.timeStarted.getEpochSecond()))
                     .operator("GT")
                     .propertyName("lastmodifieddate")
@@ -238,15 +240,15 @@ public class IntegrationRoutines {
                     .method("POST",RequestBody.create(Application.om.writeValueAsString(searchv3),MEDIA_TYPE))
                     .build();
 
-            HSSearchResponse response = Application.om.readValue(restClient.newCall(searchRequest).execute().body().string(),HSSearchResponse.class);
+            HSSearchResponseV3 response = Application.om.readValue(restClient.newCall(searchRequest).execute().body().string(), HSSearchResponseV3.class);
             if(response.getTotal().equals(numberOfContactsModified)) {
                 log.info(String.format("[VERIFY] %s contacts updated/created",numberOfContactsModified));
             }
             else {
                 if(retries+1>4) {
-                    log.error("[VERIFY] Unable to verify modified contacts after 3 retries.. ");
+                    log.error("[VERIFY] Unable to verify modified contacts after 4 retries.. ");
                 } else {
-                    log.info("[VERIFY] Hubspot still processing.. waiting 10 seconds");
+                    log.info(String.format("[VERIFY] Hubspot still processing.. waiting 15 seconds, retry #%s",retries+1));
                     Thread.sleep(10000);
                     verify(numberOfContactsModified,retries+1);
                 }

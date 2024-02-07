@@ -9,7 +9,7 @@ import java.util.List;
 public class HSSearchV3 {
     private Integer limit;
     private String after;
-    private List<HSFilterGroup> filterGroups;
+    private List<HSFilterGroupV3> filterGroups;
     private List<String> properties;
 }
 

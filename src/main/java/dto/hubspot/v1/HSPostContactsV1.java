@@ -1,7 +1,5 @@
 package dto.hubspot.v1;
 
-import com.fasterxml.jackson.databind.PropertyNamingStrategies;
-import com.fasterxml.jackson.databind.annotation.JsonNaming;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -10,7 +8,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
-@Data @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class) @NoArgsConstructor
+@Data @NoArgsConstructor
 public class HSPostContactsV1 {
 
     private String email = null;
@@ -19,7 +17,7 @@ public class HSPostContactsV1 {
         properties.add(property);
         return this;
     }
-    public HSPostContactsV1(HSPropertyListV1 list) {
+    public HSPostContactsV1(HSPostPropertyListV1 list) {
 
         properties = new ArrayList<>(List.of(
                 new HSProperty("firstname", list.getFirstname()),

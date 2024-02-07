@@ -4,7 +4,7 @@ import lombok.Builder;
 import lombok.Data;
 
 @Data @Builder
-public class HSPropertyListV1 {
+public class HSPostPropertyListV1 {
     private String firstname;
     private String lastname;
     private String email;

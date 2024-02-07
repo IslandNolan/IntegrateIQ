@@ -41,6 +41,8 @@ public class Application {
                 IntegrationRoutines integrationRoutines = IntegrationRoutines.builder().auth(ai)
                         .build();
 
+                log.info("Using Hubspot access token: "+ai.getHubspotAuthHeader());
+
                 //Fetch from AWS
                 List<SampleDataDto> contacts = integrationRoutines.fetchAWSContacts();
 
@@ -54,6 +56,6 @@ public class Application {
                 log.error(ex.getMessage());
             }
 
-        } else log.info("CLI Arguments not supported, please modify the settings.json file to change credentials");
+        } else log.info("CLI Arguments not supported, please modify the settings.json.old file to change credentials");
     }
 }
